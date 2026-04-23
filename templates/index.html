@@ -3,11 +3,12 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Chilli KB — Internal Q&A</title>
-    <meta name="description" content="Chilli internal knowledge base powered by Claude AI. Ask questions about company policies, HR, and processes.">
+    <title>Chilli Chat Bot</title>
+    <meta name="description" content="Chilli Chat Bot. Let ask questions about company policies, HR, and processes.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Roboto:wght@300;400;500&display=swap" rel="stylesheet">
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='images/Outlook-Chilli.png') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
@@ -15,107 +16,89 @@
 
         <!-- ── Sidebar ── -->
         <aside class="sidebar" id="sidebar">
-            <div class="sidebar-logo">
-                <span class="logo-icon">🌶️</span>
-                <span class="logo-text">Chilli KB</span>
+            <div class="sidebar-header">
+                <div class="sidebar-logo">
+                    <img src="{{ url_for('static', filename='images/Outlook-Chilli.png') }}" alt="Chilli Logo" class="logo-img">
+                    <span class="logo-text">Chilli</span>
+                </div>
+                <div class="header-actions">
+                    <button class="new-chat-btn" id="newChatBtn">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+                        </svg>
+                        <span id="newChatLabel">New Chat</span>
+                    </button>
+                </div>
             </div>
 
-            <!-- API Key -->
+            <!-- Search Modes -->
             <div class="sidebar-section">
-                <label class="sidebar-label">Claude API Key</label>
-                <div class="api-key-wrap">
-                    <input type="password" id="apiKeyInput" class="api-key-input"
-                        placeholder="sk-ant-..." autocomplete="off">
-                    <div class="api-status" id="apiStatus">
-                        <span class="status-dot" id="statusDot"></span>
-                        <span id="statusText">Not set</span>
-                    </div>
+                <label class="sidebar-label" id="searchModeLabel">Search Mode</label>
+                <div class="mode-selector">
+                    <button class="mode-item active" data-mode="all">
+                        <span class="mode-icon">🌐</span>
+                        <span class="mode-name" id="modeGlobalLabel">Global Search</span>
+                    </button>
+                    <button class="mode-item" data-mode="internal">
+                        <span class="mode-icon">📄</span>
+                        <span class="mode-name" id="modeInternalLabel">Internal Policies</span>
+                    </button>
+                    <button class="mode-item" data-mode="legal">
+                        <span class="mode-icon">⚖️</span>
+                        <span class="mode-name" id="modeLegalLabel">Legal & Compliance</span>
+                    </button>
                 </div>
             </div>
 
-            <!-- Knowledge base -->
-            <div class="sidebar-section">
-                <label class="sidebar-label">Knowledge Base</label>
-                <div class="kb-stats" id="kbStats">
-                    <div class="kb-stat">
-                        <span class="kb-num" id="docCount">{{ doc_count }}</span>
-                        <span class="kb-lbl">Documents</span>
-                    </div>
-                    <div class="kb-stat">
-                        <span class="kb-num" id="queryCount">0</span>
-                        <span class="kb-lbl">Queries</span>
-                    </div>
+            <!-- Chat History -->
+            <div class="sidebar-section history-section">
+                <label class="sidebar-label" id="historyLabel">Recent Conversations</label>
+                <div class="chat-history" id="chatHistory">
+                    <div class="history-empty" id="historyEmptyLabel">No conversations yet</div>
                 </div>
-            </div>
-
-            <!-- Document list -->
-            <div class="sidebar-section sidebar-docs">
-                <label class="sidebar-label">Sources</label>
-                <div class="doc-list" id="docList">
-                    <div class="doc-loading">Loading sources…</div>
-                </div>
-            </div>
-
-            <!-- Actions -->
-            <div class="sidebar-actions">
-                <button class="sidebar-btn" id="clearBtn">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <polyline points="1 4 1 10 7 10"/><polyline points="23 20 23 14 17 14"/>
-                        <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/>
-                    </svg>
-                    New Conversation
-                </button>
             </div>
 
             <div class="sidebar-footer">
-                Powered by Claude + FAISS + BM25<br>
-                Stage 2 Assignment · Chilli
+                <div class="footer-info">
+                    <span>Chilli Chat Bot v1.0</span>
+                </div>
             </div>
         </aside>
 
         <!-- ── Main ── -->
         <div class="main-wrap">
 
-            <!-- Header -->
-            <header class="app-header">
-                <button class="icon-btn" id="sidebarToggle" aria-label="Toggle sidebar">
-                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/>
-                    </svg>
-                </button>
-                <span class="header-title">Internal Knowledge Base</span>
-                <div class="header-chips">
-                    <span class="chip chip-hybrid">Hybrid RAG</span>
-                    <span class="chip chip-claude">Claude</span>
-                </div>
-            </header>
+            <!-- Main Content -->
+            <div class="main-content">
+                <header class="top-header">
+                    <div class="header-left">
+                        <button class="sidebar-toggle" id="sidebarToggle">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="header-right">
+                        <button class="lang-toggle" id="langToggle" title="Switch Language">
+                            <span class="vn-text">VN</span>
+                            <span class="en-text">EN</span>
+                        </button>
+                    </div>
+                </header>
 
             <!-- Chat content -->
             <main class="chat-content" id="chatContent">
 
                 <!-- Welcome -->
                 <div class="welcome-screen" id="welcomeScreen">
-                    <div class="welcome-logo">🌶️</div>
-                    <h1 class="welcome-title">Chilli Knowledge Base</h1>
-                    <p class="welcome-sub">Hỏi bất cứ điều gì về các văn bản quy phạm pháp luật và chính sách nội bộ.<br>Tôi sẽ tìm kiếm trong các tài liệu hợp nhất để đưa ra câu trả lời chính xác.</p>
+                    <div class="welcome-logo">
+                        <img src="{{ url_for('static', filename='images/Outlook-Chilli.png') }}" alt="Chilli Logo">
+                    </div>
+                    <h1 class="welcome-title" id="welcomeTitle">Chilli Knowledge Base</h1>
+                    <p class="welcome-sub" id="welcomeSub">Hỏi bất cứ điều gì về các văn bản quy phạm pháp luật và chính sách nội bộ.<br>Tôi sẽ tìm kiếm trong các tài liệu hợp nhất để đưa ra câu trả lời chính xác.</p>
 
-                    <div class="welcome-cards">
-                        <button class="welcome-card" data-q="Luật Xây dựng quy định gì về giấy phép xây dựng?">
-                            <span class="wc-icon">🏗️</span>
-                            <span class="wc-text">Luật Xây dựng quy định gì về giấy phép xây dựng?</span>
-                        </button>
-                        <button class="welcome-card" data-q="Luật Nhà ở quy định như thế nào về sở hữu nhà ở của người nước ngoài?">
-                            <span class="wc-icon">🏠</span>
-                            <span class="wc-text">Luật Nhà ở quy định như thế nào về sở hữu nhà ở của người nước ngoài?</span>
-                        </button>
-                        <button class="welcome-card" data-q="Nêu các quy định về phòng chống tham nhũng trong văn bản hợp nhất?">
-                            <span class="wc-icon">🛡️</span>
-                            <span class="wc-text">Nêu các quy định về phòng chống tham nhũng trong văn bản hợp nhất?</span>
-                        </button>
-                        <button class="welcome-card" data-q="Quy trình giám định tư pháp được thực hiện như thế nào?">
-                            <span class="wc-icon">⚖️</span>
-                            <span class="wc-text">Quy trình giám định tư pháp được thực hiện như thế nào?</span>
-                        </button>
+                    <div class="welcome-cards" id="welcomeCards">
+                        <!-- Populated by JS based on mode -->
                     </div>
                 </div>
 
@@ -124,7 +107,9 @@
 
                 <!-- Typing indicator -->
                 <div class="typing-indicator" id="typingIndicator" style="display:none;">
-                    <div class="typing-avatar">🌶️</div>
+                    <div class="typing-avatar">
+                        <img src="{{ url_for('static', filename='images/Outlook-Chilli.png') }}" alt="Chilli">
+                    </div>
                     <div class="typing-dots">
                         <div class="typing-dot"></div>
                         <div class="typing-dot"></div>
@@ -138,7 +123,7 @@
                 <form class="input-form" id="inputForm">
                     <div class="input-wrapper" id="inputWrapper">
                         <textarea class="input-field" id="inputField"
-                            placeholder="Ask about leave, expenses, remote work, policies…"
+                            placeholder="Ask about company policies, HR, process and legal ..."
                             rows="1" autocomplete="off"></textarea>
                         <button type="submit" class="send-btn" id="sendBtn" aria-label="Send">
                             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
@@ -146,7 +131,7 @@
                             </svg>
                         </button>
                     </div>
-                    <p class="input-hint">Chilli KB searches across all company documents · Answers include source citations</p>
+                    <p class="input-hint">Chilli Chat Bot</p>
                 </form>
             </footer>
         </div>

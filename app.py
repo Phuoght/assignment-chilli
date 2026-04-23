@@ -2,390 +2,341 @@ import os
 import re
 import json
 import secrets
+import pickle
 import numpy as np
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 
-from flask import Flask, render_template, request, jsonify, session
-from langchain_community.document_loaders import DirectoryLoader, Docx2txtLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from flask import Flask, render_template, request, jsonify, session, Response
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
-from anthropic import Anthropic
+from openai import OpenAI
 
 # Load environment variables
 load_dotenv()
 
-# ─────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 
-# ─────────────────────────────────────────────────────────────
 # Config
-# ─────────────────────────────────────────────────────────────
-DOCS_DIR     = "docs"
-FAISS_INDEX  = "vectorstore/law.faiss"
 EMBED_MODEL  = "BAAI/bge-m3"
-CHUNK_SIZE   = 1000
-CHUNK_OVERLAP = 200
-TOP_K        = 8
-MAX_TOKENS   = 1500
-
+TOP_K        = 20
+MAX_TOKENS   = 2000
 NINEROUTER_API_KEY = os.getenv("NINEROUTER_API_KEY")
 NINEROUTER_MODEL = os.getenv("NINEROUTER_MODEL", "maple-combo")
 
-SYSTEM_PROMPT = """You are Chilli Legal & HR Assistant — an expert in Vietnamese legal documents and company policies for Chilli.
+SYSTEM_PROMPT = """<system>
+  <identity>
+    <role>Chilli Legal & HR Assistant</role>
+    <expertise>Pháp luật Việt Nam và chính sách nhân sự</expertise>
+  </identity>
 
-Your role:
-- Answer questions accurately using ONLY the provided document context
-- Vietnamese legal documents can be complex; explain them clearly and professionally
-- Always cite your sources using [1], [2], etc. inline
-- If the answer is not in the context, respond: "I couldn't find this in our documents. Please contact HR at hr@chilli.com"
-- Format answers with clear structure: bullet points, numbered lists, bold key terms
-- Respond in the same language as the question (English or Vietnamese)
-- Never fabricate legal advice or extrapolate beyond the documents"""
+  <core_instruction>
+    <guideline>Chỉ trích dẫn từ Context được cung cấp, không thêm thông tin từ kiến thức chung</guideline>
+    <guideline>Giải thích rõ ràng các thuật ngữ chuyên môn và tiếng nước ngoài</guideline>
+    <guideline>Khi không có thông tin, hãy nói thẳng ra thay vì guessing</guideline>
+    <guideline>TUYỆT ĐỐI KHÔNG sử dụng các thẻ HTML (như &lt;br&gt;, &lt;b&gt;, &lt;i&gt;). Chỉ sử dụng Markdown thuần túy.</guideline>
+  </core_instruction>
+
+  <style>
+    <tone>Chuyên nghiệp nhưng thân thiện, chi tiết nhưng dễ tiếp cận</tone>
+    <approach>Tự do chọn cách trình bày phù hợp với từng câu hỏi (không bắt buộc theo format cố định)</approach>
+    <formatting>Sử dụng Markdown một cách tự nhiên để làm cho nội dung dễ đọc</formatting>
+  </style>
+
+  <citation>
+    <method>Trích dẫn nguồn bằng [1], [2]... sau mỗi thông tin từ Context</method>
+    <requirement>Rõ ràng nhưng không cườn cứng</requirement>
+  </citation>
+</system>
+"""
 
 # ─────────────────────────────────────────────────────────────
-# Hybrid RAG Retriever (FAISS + BM25 + Reciprocal Rank Fusion)
+# Hybrid RAG Retriever
 # ─────────────────────────────────────────────────────────────
 class HybridRetriever:
-    def __init__(self, docs: list[Document] = None):
-        print(f"🔧 Initializing HybridRetriever with {EMBED_MODEL}...")
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=EMBED_MODEL,
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True},
-        )
-        
+    def __init__(self, index_name: str, jsonl_file: str, embeddings):
+        self.index_name = index_name
         self.chunks = []
-        if docs:
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=CHUNK_SIZE,
-                chunk_overlap=CHUNK_OVERLAP,
-                separators=["\n\n", "\n", ".", " "],
-            )
-            self.chunks = splitter.split_documents(docs)
+        self.vectorstore = None
+        self.bm25 = None
+        self.chunk_map = {}
 
-        # Enrich metadata
-        # FAISS vector store
-        if Path(FAISS_INDEX).exists():
+        print(f"🔧 [Init] Setting up Retriever for [{index_name}]...")
+        
+        # Load FAISS
+        faiss_dir = "vectorstore"
+        if (Path(faiss_dir) / f"{index_name}.faiss").exists() or (Path(faiss_dir) / f"{index_name}.index").exists():
             self.vectorstore = FAISS.load_local(
-                str(Path(FAISS_INDEX).parent), 
-                self.embeddings, 
-                index_name=Path(FAISS_INDEX).name.replace('.faiss', ''),
+                faiss_dir, 
+                embeddings, 
+                index_name=index_name,
                 allow_dangerous_deserialization=True
             )
-            print(f"✅ Loaded FAISS from {FAISS_INDEX}")
-            
-            # Load chunks for BM25 from JSONL if possible
-            if Path("chunks.jsonl").exists():
-                print("📖 Loading chunks from chunks.jsonl for BM25...")
-                with open("chunks.jsonl", "r", encoding="utf-8") as f:
-                    for line in f:
-                        data = json.loads(line)
-                        self.chunks.append(Document(page_content=data["text"], metadata=data["metadata"]))
-            else:
-                # Sync from vectorstore (less metadata)
-                print("⚠️ chunks.jsonl not found, syncing from vectorstore...")
-                self.chunks = [
-                    Document(page_content=self.vectorstore.docstore.search(id).page_content, 
-                             metadata=self.vectorstore.docstore.search(id).metadata)
-                    for id in self.vectorstore.index_to_docstore_id.values()
-                ]
-        else:
-            if not docs:
-                raise ValueError("FAISS index not found and no documents provided to build one.")
-            
-            print("⚠️ FAISS index not found. Building with default splitter...")
-            splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-            self.chunks = splitter.split_documents(docs)
-            for i, chunk in enumerate(self.chunks):
-                chunk.metadata["chunk_id"] = i
-                chunk.metadata["file"] = Path(chunk.metadata.get("source", "unknown")).name
-            self.vectorstore = FAISS.from_documents(self.chunks, self.embeddings)
-            self.vectorstore.save_local(str(Path(FAISS_INDEX).parent), index_name=Path(FAISS_INDEX).name.replace('.faiss', ''))
+            print(f"   ✅ FAISS [{index_name}] Loaded.")
         
-        for i, chunk in enumerate(self.chunks):
-            chunk.metadata["chunk_id"] = i
+        # Load Chunks & BM25 (with Cache)
+        bm25_cache_path = Path(faiss_dir) / f"{index_name}_bm25.pkl"
+        
+        if Path(jsonl_file).exists():
+            # Load Chunks
+            with open(jsonl_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    data = json.loads(line)
+                    self.chunks.append(Document(page_content=data["text"], metadata=data["metadata"]))
+            self.chunk_map = {i: doc for i, doc in enumerate(self.chunks)}
 
-        # BM25 sparse retriever
-        tokenized_corpus = [
-            re.findall(r"[\w]+", doc.page_content.lower())
-            for doc in self.chunks
-        ]
-        self.bm25 = BM25Okapi(tokenized_corpus)
-        self.chunk_map = {i: doc for i, doc in enumerate(self.chunks)}
-        print(f"✅ BM25 built over {len(self.chunks)} chunks")
+            # Try loading BM25 from cache
+            if bm25_cache_path.exists():
+                try:
+                    with open(bm25_cache_path, "rb") as f:
+                        self.bm25 = pickle.load(f)
+                    print(f"   ✅ BM25 [{index_name}] Loaded from cache.")
+                except Exception as e:
+                    print(f"   ⚠️ [Warning] Failed to load BM25 cache: {e}. Rebuilding...")
+            
+            # Build if not loaded
+            if not self.bm25:
+                print(f"   🔨 Building BM25 index for [{index_name}] (this may take a while)...")
+                tokenized_corpus = [re.findall(r"[\w\u4e00-\u9fff]+", doc.page_content.lower()) for doc in self.chunks]
+                self.bm25 = BM25Okapi(tokenized_corpus)
+                
+                # Save cache
+                with open(bm25_cache_path, "wb") as f:
+                    pickle.dump(self.bm25, f)
+                print(f"   ✅ BM25 [{index_name}] Built and Cached ({len(self.chunks)} chunks).")
 
     def retrieve(self, query: str, k: int = TOP_K) -> list[Document]:
-        """Hybrid retrieval: FAISS + BM25 fused with Reciprocal Rank Fusion (RRF)."""
-        # Dense retrieval
-        vector_docs = self.vectorstore.similarity_search(query, k=k * 2)
+        if not self.vectorstore or not self.bm25:
+            print(f"⚠️ [Error] Retriever [{self.index_name}] is not properly initialized.")
+            return []
 
-        # Sparse retrieval
-        tokenized_query = re.findall(r"[\w]+", query.lower())
+        print(f"   🔎 [{self.index_name}] Step 1: Dense Search (FAISS)...")
+        vector_docs = self.vectorstore.similarity_search(query, k=k * 2)
+        
+        print(f"   🔎 [{self.index_name}] Step 2: Sparse Search (BM25)...")
+        tokenized_query = re.findall(r"[\w\u4e00-\u9fff]+", query.lower())
         bm25_scores = self.bm25.get_scores(tokenized_query)
         bm25_top_indices = np.argsort(bm25_scores)[::-1][: k * 2]
 
-        # RRF fusion (k=60 is standard)
-        rrf: dict[int, float] = {}
+        print(f"   🔎 [{self.index_name}] Step 3: RRF Fusion...")
+        rrf = {}
         for rank, doc in enumerate(vector_docs):
             idx = doc.metadata.get("chunk_id")
-            if idx is not None:
-                rrf[idx] = rrf.get(idx, 0) + 1 / (rank + 60)
+            if idx is not None: rrf[idx] = rrf.get(idx, 0) + 1 / (rank + 60)
         for rank, idx in enumerate(bm25_top_indices):
             rrf[idx] = rrf.get(idx, 0) + 1 / (rank + 60)
 
-        # Take top-k by RRF score
         top_indices = sorted(rrf.items(), key=lambda x: x[1], reverse=True)[:k]
         return [self.chunk_map[i] for i, _ in top_indices if i in self.chunk_map]
 
-    def generate_suggested_questions(self, recent_queries: list[str] = None, n: int = 3) -> list[str]:
-        """Generate context-aware follow-up questions using Claude."""
-        sample = "\n".join(
-            f"[{c.metadata['file']}]: {c.page_content[:200]}"
-            for c in self.chunks[:12]
-        )
-        history_block = ""
-        if recent_queries:
-            history_block = "\n\nRECENT QUESTIONS ASKED (do NOT repeat):\n" + "\n".join(
-                f"- {q}" for q in recent_queries[-5:]
+# ─────────────────────────────────────────────────────────────
+# Singleton Manager
+# ─────────────────────────────────────────────────────────────
+class RAGManager:
+    _instance = None
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(RAGManager, cls).__new__(cls)
+            cls._instance.retrievers = {}
+            cls._instance._embeddings = None
+        return cls._instance
+
+    @property
+    def embeddings(self):
+        if self._embeddings is None:
+            print(f"🚀 [System] Loading Embedding Model: {EMBED_MODEL}...")
+            self._embeddings = HuggingFaceEmbeddings(
+                model_name=EMBED_MODEL,
+                model_kwargs={"device": "cpu"},
+                encode_kwargs={"normalize_embeddings": True},
             )
+            print("✅ [System] Embedding Model Loaded.")
+        return self._embeddings
 
-        prompt = f"""You are an HR knowledge base assistant for Chilli company.
-Based on the document excerpts below, suggest {n} SPECIFIC, USEFUL follow-up questions an employee might ask.
+    def get_retriever(self, mode="law"):
+        if mode not in self.retrievers:
+            if mode == "law":
+                self.retrievers["law"] = HybridRetriever("law", "law_chunks.jsonl", self.embeddings)
+            else:
+                self.retrievers["internal"] = HybridRetriever("internal_policies", "internal_policies_chunks.jsonl", self.embeddings)
+        return self.retrievers[mode]
 
-DOCUMENT EXCERPTS:
-{sample}
-{history_block}
-
-RULES:
-- Each question must be answerable from the documents
-- Avoid generic questions like "What is the policy?"
-- Be specific (e.g., "How many sick leave days can I carry over?")
-- 8–15 words each
-- Format: numbered list 1. 2. 3.
-- Questions in English only"""
-
-        try:
-            if not NINEROUTER_API_KEY:
-                return []
-            client = Anthropic(api_key=NINEROUTER_API_KEY, base_url="http://localhost:20128/v1")
-            resp = client.messages.create(
-                model=NINEROUTER_MODEL,
-                max_tokens=800,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = resp.content[0].text
-            questions = []
-            for line in text.split("\n"):
-                line = line.strip()
-                if re.match(r"^\d+\.", line):
-                    q = re.sub(r"^\d+\.\s*", "", line).strip()
-                    if q and len(q) > 8:
-                        questions.append(q)
-            return questions[:n]
-        except Exception as e:
-            print(f"Suggested questions error: {e}")
-            return []
-
+rag_manager = RAGManager()
 
 # ─────────────────────────────────────────────────────────────
-# Document Loader
-# ─────────────────────────────────────────────────────────────
-def load_documents() -> list[Document] | None:
-    if not Path(DOCS_DIR).exists():
-        return None
-    
-    # Support for both .docx and old .doc files
-    docs = []
-    
-    # Try loading .docx
-    try:
-        docx_loader = DirectoryLoader(DOCS_DIR, glob="**/*.docx", loader_cls=Docx2txtLoader)
-        docs.extend(docx_loader.load())
-    except Exception as e:
-        print(f"⚠️ Docx loading error: {e}")
-
-    # Try loading .doc (requires unstructured or similar)
-    try:
-        from langchain_community.document_loaders import UnstructuredWordDocumentLoader
-        # List all .doc files
-        doc_files = list(Path(DOCS_DIR).glob("**/*.doc"))
-        for f in doc_files:
-            try:
-                loader = UnstructuredWordDocumentLoader(str(f))
-                docs.extend(loader.load())
-            except Exception as e:
-                print(f"⚠️ Error loading {f}: {e}")
-    except Exception as e:
-        print(f"⚠️ Doc loading (.doc) requires 'unstructured'. Falling back. {e}")
-
-    return docs if docs else None
-
-
-# Global Retriever Cache
-# ─────────────────────────────────────────────────────────────
-_retriever: HybridRetriever | None = None
-
-def get_retriever() -> HybridRetriever:
-    global _retriever
-    if _retriever is None:
-        # Check if index exists first
-        if Path(FAISS_INDEX).exists():
-            _retriever = HybridRetriever()
-        else:
-            docs = load_documents()
-            if not docs:
-                raise ValueError("FAISS index not found and no documents available. Please run legal_chunker.py first.")
-            _retriever = HybridRetriever(docs)
-    return _retriever
-
-
-# Initialize on startup is now handled at the bottom of the file
-
-
-# ─────────────────────────────────────────────────────────────
-# Routes
+# Flask Routes
 # ─────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    if "messages" not in session:
-        session["messages"] = []
-    doc_files = [p.name for p in Path(DOCS_DIR).glob("**/*.docx")] if Path(DOCS_DIR).exists() else []
-    return render_template("index.html", doc_count=len(doc_files))
-
+    return render_template("index.html")
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
     try:
-        data  = request.json or {}
+        data = request.json or {}
         query = data.get("message", "").strip()
+        ui_mode = data.get("mode", "all") 
+        lang = data.get("lang", "vi")
+        history = data.get("history", [])
 
-        if not query:
-            return jsonify({"error": "Message is required"}), 400
+        if not query: return jsonify({"error": "Message is required"}), 400
+        
         if not NINEROUTER_API_KEY:
             return jsonify({"error": "NineRouter API key is not configured in .env"}), 500
 
-        retriever = get_retriever()
-        docs = retriever.retrieve(query)
+        client = OpenAI(api_key=NINEROUTER_API_KEY, base_url="http://localhost:20128/v1")
 
-        # Build context string
-        context_parts = []
-        for i, doc in enumerate(docs):
-            source = doc.metadata.get("file", doc.metadata.get("source", "Unknown"))
-            context_parts.append(
-                f"<document id='{i+1}' source='{source}'>\n{doc.page_content}\n</document>"
-            )
-        context = "\n\n".join(context_parts)
+        # Step 0: Query Rewriting for Memory
+        search_query = query
+        if history:
+            try:
+                rewrite_sys = "Nhiệm vụ: Viết lại câu hỏi của người dùng thành một câu khẳng định tìm kiếm RAG đầy đủ bằng tiếng Việt. QUY TẮC: 1. CHỈ trả về kết quả cuối cùng. 2. KHÔNG giải thích, không 'Dựa trên...', không 'Câu hỏi là...'. 3. KHÔNG sử dụng bất kỳ ngôn ngữ nào khác ngoài tiếng Việt."
+                hist_context = "\n".join([f"{m['role']}: {m['content'][:200]}" for m in history[-2:]])
+                rewrite_prompt = f"Lịch sử:\n{hist_context}\n\nCâu hỏi mới: {query}"
+                
+                rewrite_res = client.chat.completions.create(
+                    model=NINEROUTER_MODEL,
+                    messages=[
+                        {"role": "system", "content": rewrite_sys},
+                        {"role": "user", "content": rewrite_prompt}
+                    ],
+                    max_tokens=100,
+                    temperature=0
+                )
+                raw_rewrite = rewrite_res.choices[0].message.content.strip()
+                # Clean meta-text if AI ignores instructions
+                if "viết lại" in raw_rewrite.lower() or "câu hỏi" in raw_rewrite.lower():
+                    lines = raw_rewrite.split('\n')
+                    search_query = lines[-1].strip('- ').strip()
+                else:
+                    search_query = raw_rewrite
+                
+                print(f"🔍 [Query Rewrite]: '{query}' -> '{search_query}'")
+            except Exception as e:
+                print(f"⚠️ Rewrite Error: {e}")
 
-        # Build conversation history (last 6 turns)
-        if "messages" not in session:
-            session["messages"] = []
+        retriever_keys = []
+        if ui_mode == "all":
+            retriever_keys = ["law", "internal"]
+        elif ui_mode == "legal":
+            retriever_keys = ["law"]
+        else:
+            retriever_keys = ["internal"]
 
-        messages = []
-        for m in session["messages"][-6:]:
-            messages.append({"role": m["role"], "content": m["content"]})
+        all_docs = []
+        for r_key in retriever_keys:
+            r = rag_manager.get_retriever(r_key)
+            all_docs.extend(r.retrieve(search_query, k=TOP_K))
 
-        # Current user message with RAG context
-        prompt_instructions = """Bạn là chuyên gia về văn bản pháp quy và chính sách tại Chilli. Hãy trả lời câu hỏi dựa trên các tài liệu hợp nhất được cung cấp theo phong cách NotebookLM.
+        docs = all_docs[:TOP_K]
+        context = "\n\n".join([f"<doc id='{i+1}'>{d.page_content}</doc>" for i, d in enumerate(docs)])
+        refs = [{"id": i+1, "file": d.metadata.get("file", "Unknown"), "content": d.page_content[:250]} for i, d in enumerate(docs)]
 
-💡 HƯỚNG DẪN TRẢ LỜI:
-1. CHỈ sử dụng thông tin từ tài liệu được cung cấp. Không dùng kiến thức bên ngoài.
-2. CẤU TRÚC TRẢ LỜI:
-   - Mở đầu: Tóm tắt ý chính của quy định (1-2 câu).
-   - Nội dung chi tiết: Chia thành các mục (##, ###), giải thích rõ các điều khoản, quy trình.
-   - Trích dẫn: Luôn ghi [1], [2]... ngay sau thông tin lấy từ nguồn tương ứng.
-3. VĂN PHONG: Trang trọng, chính xác, khách quan.
-4. ĐỘ DÀI: Trả lời đầy đủ, chi tiết."""
+        def generate():
+            yield f"data: {json.dumps({'references': refs})}\n\n"
 
-        user_content = f"""{prompt_instructions}
+            # Prepare messages with Memory embedded in content
+            history_str = ""
+            if history:
+                history_items = []
+                for m in history:
+                    role_label = "User" if m["role"] == "user" else "Chilli"
+                    history_items.append(f"{role_label}: {m['content']}")
+                history_str = "\n".join(history_items)
 
-📚 TÀI LIỆU THAM KHẢO:
+            # Combined Prompt with explicit sections
+            user_content = f"""
+### CONVERSATION HISTORY:
+{history_str if history_str else "No previous messages."}
+
+### SEARCHED CONTEXT:
 {context}
 
-❓ CÂU HỎI:
-{query}"""
-        messages.append({"role": "user", "content": user_content})
+### CURRENT QUESTION:
+{query}
+""".strip()
 
-        # Call AI via NineRouter (using Anthropic compatible client)
-        client = Anthropic(api_key=NINEROUTER_API_KEY, base_url="http://localhost:20128/v1")
-        resp = client.messages.create(
-            model=NINEROUTER_MODEL,
-            max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            messages=messages,
-        )
-        answer = resp.content[0].text
+            messages = [
+                {"role": "system", "content": f"{SYSTEM_PROMPT}\nScope: {ui_mode}.\nResponse Language: {lang} (Strictly answer in this language)."},
+                {"role": "user", "content": user_content}
+            ]
 
-        # Build references list for frontend
-        references = []
-        for i, doc in enumerate(docs):
-            meta = doc.metadata
-            # Hiển thị tiêu đề thông minh: Tên Luật + Điều
-            display_name = f"{meta.get('law_name', meta.get('file', 'Unknown'))} - {meta.get('article', 'N/A')}"
-            if meta.get('clause') and meta.get('clause') != 'Toàn văn':
-                display_name += f" ({meta.get('clause')})"
+            stream = client.chat.completions.create(
+                model=NINEROUTER_MODEL,
+                max_tokens=MAX_TOKENS,
+                messages=messages,
+                stream=True
+            )
+
+            full_response = ""
+            for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    token = chunk.choices[0].delta.content
+                    full_response += token
+                    yield f"data: {json.dumps({'token': token})}\n\n"
             
-            preview = " ".join(doc.page_content.split())
-            if len(preview) > 250:
-                preview = preview[:250] + "…"
+            # Generate dynamic suggestions based on the response
+            try:
+                lang_name = "tiếng Việt" if lang == "vi" else "English"
+                suggestion_sys = f"Bạn là trợ lý đề xuất câu hỏi. CHỈ trả về đúng 3 câu hỏi bằng {lang_name} liên quan đến câu trả lời trước đó. Định dạng: Mỗi câu hỏi trên một dòng. KHÔNG đánh số, KHÔNG giải thích, KHÔNG nói gì thêm."
+                suggest_prompt = f"Câu trả lời: {full_response[:800]}\n\nĐề xuất 3 câu hỏi tiếp theo:"
                 
-            references.append({
-                "id": i + 1,
-                "file": display_name,
-                "content": preview,
-                "full_meta": meta
-            })
+                print(f"🤖 [Suggestion] Generating for {lang_name}...")
+                
+                suggestion_res = client.chat.completions.create(
+                    model=NINEROUTER_MODEL,
+                    messages=[
+                        {"role": "system", "content": suggestion_sys},
+                        {"role": "user", "content": suggest_prompt}
+                    ],
+                    max_tokens=200,
+                    temperature=0.1
+                )
+                raw_content = suggestion_res.choices[0].message.content.strip()
+                print(f"✅ [Suggestion] AI Returned: {raw_content}")
+                
+                print(f"DEBUG: Suggestions result: {raw_sugg}")
+                suggestions = []
+                for s in raw_sugg:
+                    s_clean = s.strip('- ').strip('123. ').strip()
+                    if s_clean and ('?' in s_clean or len(s_clean) > 10):
+                        # Filter out meta-text
+                        if not any(word in s_clean.lower() for word in ['let\'s', 'produce', 'output', 'here are', 'assistant']):
+                            suggestions.append(s_clean)
+                
+                suggestions = suggestions[:3]
+                if not suggestions: raise ValueError("Empty suggestions after parsing")
+                print(f"🚀 [Suggestion] Final list: {suggestions}")
+            except Exception as e:
+                print(f"❌ [Suggestion Error]: {e}")
+                suggestions = ["Tìm hiểu thêm về mục này", "Ví dụ cụ thể là gì?", "Quy trình thực hiện như thế nào?"]
 
-        # Save to session
-        session["messages"].append({"role": "user", "content": query, "ts": datetime.now().isoformat()})
-        session["messages"].append({"role": "assistant", "content": answer, "ts": datetime.now().isoformat()})
-        session.modified = True
+            yield f"data: {json.dumps({'suggested_questions': suggestions})}\n\n"
+            yield "data: [DONE]\n\n"
 
-        # Suggested questions
-        recent_q = [m["content"] for m in session["messages"] if m["role"] == "user"]
-        suggested = retriever.generate_suggested_questions(recent_q)
-
-        return jsonify({
-            "response": answer,
-            "references": references,
-            "suggested_questions": suggested,
-        })
+        return Response(generate(), mimetype='text/event-stream')
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        print(f"❌ [Exception] Error in /api/chat: {e}")
         return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/clear", methods=["POST"])
-def clear_chat():
-    session["messages"] = []
-    session.modified = True
-    return jsonify({"status": "ok"})
-
 
 @app.route("/api/status", methods=["GET"])
 def status():
-    doc_files = list(Path(DOCS_DIR).glob("**/*.docx")) if Path(DOCS_DIR).exists() else []
-    index_ready = Path(FAISS_INDEX).exists()
-    return jsonify({
-        "doc_count": len(doc_files),
-        "index_ready": index_ready,
-        "docs": [f.name for f in doc_files],
-    })
-
+    return jsonify({"status": "ready", "modes": ["law", "internal"]})
 
 if __name__ == "__main__":
-    # Pre-load retriever once on startup
-    try:
-        get_retriever()
-        print("🚀 Server is ready and model is loaded!")
-    except Exception as e:
-        print(f"⚠️ Error during pre-loading: {e}")
-        
+    # ONLY pre-warm in the main worker process, not the reloader's watcher process
+    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        print("🔥 [System] Pre-warming RAG models in main worker...")
+        # Note: Pre-warming will still take time on first run, 
+        # but BM25 caching will make subsequent starts much faster.
+        rag_manager.get_retriever("law")
+        rag_manager.get_retriever("internal")
+    else:
+        print("🔍 [System] Flask watcher starting...")
+
     app.run(debug=True, host="0.0.0.0", port=5000)

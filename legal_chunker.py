@@ -17,7 +17,7 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 INPUT_DIR   = "./docs/law_VN"
 OUTPUT_DIR  = "./vectorstore"
 INDEX_NAME  = "law"
-JSONL_PATH  = "chunks.jsonl"
+JSONL_PATH  = "law_chunks.jsonl"
 EMBED_MODEL = "BAAI/bge-m3"
 
 CHUNK_MAX = 600
